@@ -1,0 +1,42 @@
+# Put commands to run on every boot here
+mkdir /out
+mount -t 9p -o trans=virtio \
+      test_mount /out \
+      -oversion=9p2000.L,posixacl,cache=loose
+insmod /out/kernel/fs/fuse/fuse.ko
+mdev -s
+PATH=$PATH:/out/kernel/tools/testing/selftests/filesystems/fuse:/out/bin
+mount -t debugfs nodev /sys/kernel/debug
+mkdir /mnt
+echo 'file fs/incfs/* +pflmt' > /sys/kernel/debug/dynamic_debug/control
+echo 'file fs/verity/* +pflmt' > /sys/kernel/debug/dynamic_debug/control
+echo 'file fs/fuse/* +pflmt' > /sys/kernel/debug/dynamic_debug/control
+echo 'file fs/namei.c +pflmt' > /sys/kernel/debug/dynamic_debug/control
+echo 'file kernel/bpf/bpf_fuse* +pflmt' > /sys/kernel/debug/dynamic_debug/control
+for i in $(seq 1 PASSES)
+do
+	mount /dev/vda /data
+	cd /data
+	rm incfs-mount-dir-src/ -rf
+	echo ===============================================================
+	echo Pass $i
+	echo ===============================================================
+	if ! PROGRAM
+	then
+		cd /
+		umount /data
+		break
+	fi
+	cd /
+	if umount /data
+	then
+		continue
+	else
+		break
+	fi
+done
+
+# In case you want to do more stuff
+mount /dev/vda /data
+cd /data
+

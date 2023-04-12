@@ -1,0 +1,5 @@
+#!/bin/sh
+mount proc /proc -t proc
+mount sys /sys -t sysfs
+mdev -s
+exec /bin/sh -l

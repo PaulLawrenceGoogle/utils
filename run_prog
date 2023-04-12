@@ -1,0 +1,218 @@
+function run_prog_config()
+{
+  if [ -z ${ROOT} ]; then ROOT=~/code/github; fi
+  if [ -z "${UTILS}" ]; then UTILS=${ROOT}/utils; fi
+  if [ -z "${KERNEL}" ]; then KERNEL=${ROOT}/fuse-bpf; fi
+  if [ -z "${OUT}" ]; then OUT=${ROOT}/out; fi
+}
+
+function run_prog_show_help()
+{
+	echo -e "$1 [-l=n] [-p=n] [-d] [-c] [command|--] [args...]"
+	echo -e '\t'-c do not compile
+	echo -e '\t'-d force build data file
+	echo -e '\t'-l=n set loglevel to n \(default 1, 0-8\)
+	echo -e '\t'-p=n run test n times \(default 1\)
+	echo -e '\t'-s sparse build
+	echo -e '\t'default command is ${name}_test
+	exit 0
+}
+
+function run_prog_process_command_line()
+{
+  local OPTIND
+
+  cd ${KERNEL}
+
+  loglevel=1
+  passes=1
+  arguments=
+  make_data=false
+  compile=true
+  run=true
+  sparse=false
+
+  while getopts "crdhl:p:s" opt; do
+    case "$opt" in
+    c) compile=false
+      ;;
+    r) run=false
+      ;;
+    d) make_data=true
+      ;;
+    l) loglevel=$OPTARG
+      ;;
+    p) passes=$OPTARG
+      ;;
+    s) sparse=true
+      ;;
+    h|*) run_prog_show_help run_incfs
+      return 0
+      ;;
+    esac
+  done
+
+  # To make '--' set default command requires special handling
+  if [ ! "$OPTIND" == "1" ]
+  then
+    shift $((OPTIND-2))
+
+    if [ ! "$1" == "--" ]
+    then
+      shift 1
+
+      if [ ! -z "$1" ]
+      then
+        program=$1
+        shift 1
+      fi
+    else
+      shift 1
+    fi
+  fi
+
+  arguments=$*
+}
+
+function run_prog_copy_libraries()
+{
+  if ! [[ -x "$1" ]]; then return; fi
+
+  ldd $1 | while read line
+  do
+    read -r -a words <<< $line
+    if [ "${#words[@]}" == "4" ] && [ "${words[1]}" == "=>" ]
+    then
+      cp ${words[2]} lib/${words[0]}
+    elif [ "${#words[@]}" == "2" ] && [ "${words[0]:0:1}" == "/" ]
+    then
+      cp ${words[0]} ./${words[0]}
+    fi
+  done
+}
+
+function run_prog_make_ramdisk()
+{
+  set -e
+  mkdir -p ${OUT}/tiny
+  pushd ${OUT}/tiny
+
+  mkdir -p bin
+  mkdir -p data
+  mkdir -p etc
+  mkdir -p lib
+  mkdir -p lib64
+  mkdir -p proc
+  mkdir -p sys
+
+  pushd bin
+  cp $(which busybox) .
+  busybox --list | xargs --replace=arg sh -c 'if [ ! -f arg ]; then ln busybox arg; fi'
+  rm busybox
+  popd
+
+  run_prog_copy_libraries bin/sh
+  run_prog_copy_libraries ${KERNEL_OUT}/tools/testing/selftests/filesystems/fuse/fuse_test
+
+  for i in ${OUT}/bin/*
+  do
+    run_prog_copy_libraries $i
+  done
+
+  cp ${UTILS}/tiny/init .
+
+  sed -e "s/PROGRAM/$program $arguments/g" \
+      -e "s/PASSES/$passes/g" \
+      ${UTILS}/tiny/etc/profile > ./etc/profile
+
+  find | cpio -oHnewc --owner=0:0 | gzip > ../ramdisk
+  popd
+  set +e
+}
+
+function run_prog()
+(
+  run_prog_config
+  run_prog_process_command_line $*
+
+  KERNEL_OUT=${OUT}/kernel
+
+  if [ "$compile" == "true" ]
+  then
+    set -e
+    make O=${KERNEL_OUT} defconfig `realpath --relative-to=${KERNEL}/kernel/configs ${UTILS}`/${name}.config
+    make O=${KERNEL_OUT} -j99
+    pushd tools/testing/selftests/filesystems/${name}
+    mkdir -p ${KERNEL_OUT}/tools/testing/selftests/filesystems/${name}
+    make OUTPUT=${KERNEL_OUT}/tools/testing/selftests/filesystems/${name}
+    popd
+    set +e
+  fi
+
+  if [ "$sparse" == "true" ]
+  then
+    rm ${KERNEL_OUT}/fs/${name}/*.o
+    set -e
+    make c=1 O=${KERNEL_OUT} -j99
+    read -n1 -p "sparse ok (y/n)?" ok
+    if [ "${ok}" != "y" ]
+    then
+      exit 1
+    fi
+
+    make O=${KERNEL_OUT}32 arch=arm cross_compile=arm-linux-gnueabihf- defconfig `realpath --relative-to=${KERNEL}/kernel/configs ${SHARED}`/${name}.config
+    make O=${KERNEL_OUT}32 arch=arm cross_compile=arm-linux-gnueabihf- -j99
+    rm ${KERNEL_OUT}32/fs/${name}/*.o
+    make c=1 O=${KERNEL_OUT}32 arch=arm cross_compile=arm-linux-gnueabihf- -j99
+    read -n1 -p "32-bit sparse ok (y/n)?" ok
+    if [ "${ok}" != "y" ]
+    then
+      exit 1
+    fi
+
+    set +e
+    git log --pretty=format:"%h" $(git status -sb | head -n1 | awk '{ print $2 }') | xargs scripts/checkpatch.pl --ignore gerrit_change_id --git
+    set -e
+    read -n1 -p "checkpatch ok (y/n)?" ok
+    if [ "${ok}" != "y" ]
+    then
+      exit 1
+    fi
+  fi
+
+  run_prog_make_ramdisk
+
+  if [ "$make_data" == "true" ] || [ ! -f ${SHARED}/data ]
+  then
+    if [ -f ${OUT}/data ]
+    then
+      rm ${OUT}/data
+    fi
+    mke2fs -b 4096 -t ext4 ${OUT}/data 1000000
+  fi
+
+  if [ "$run" == "true" ]
+  then
+    qemu-system-x86_64 \
+      -kernel ${KERNEL_OUT}/arch/x86_64/boot/bzImage \
+      -nographic \
+      -append "console=ttyS0 loglevel=$loglevel" \
+      -initrd ${OUT}/ramdisk \
+      -m 16384 \
+      --smp 8 \
+      -fsdev local,id=test_dev,path=${OUT},security_model=none \
+      -device virtio-9p-pci,fsdev=test_dev,mount_tag=test_mount \
+      -drive file=${OUT}/data,if=none,id=virtio-drive0,aio=threads,format=raw \
+      -device virtio-blk-pci-non-transitional,scsi=off,drive=virtio-drive0,id=virtio-blk0 \
+      -machine pc-i440fx-2.8,accel=kvm
+
+    tput smam
+  fi
+)
+
+function run_fuse_bpf()
+{
+  name=fuse
+  program=fuse_test
+  run_prog $*
+}
